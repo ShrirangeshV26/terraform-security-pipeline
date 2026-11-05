@@ -33,14 +33,3 @@ variable "private_subnet_cidrs" {
   default     = ["10.20.1.0/24", "10.20.2.0/24"]
 }
 
-variable "db_instance_class" {
-  description = "Instance class for the PostgreSQL database."
-  type        = string
-  default     = "db.t4g.medium"
-}
-
-variable "db_name" {
-  description = "Name of the initial PostgreSQL database."
-  type        = string
-  default     = "journeys"
-} 
