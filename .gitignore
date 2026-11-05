@@ -1,0 +1,40 @@
+# Terraform working directories
+.terraform/
+
+# State files (never commit: they can contain secrets)
+*.tfstate
+*.tfstate.*
+
+# Plan files
+*.tfplan
+tfplan
+tfplan.json
+
+# Variable files (may contain sensitive values); keep the example
+*.tfvars
+*.tfvars.json
+!example.tfvars
+
+# Local overrides and CLI config
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Scanner output generated in CI
+*.sarif
+results/
+
+# OS / editor files
+.DS_Store
+.vscode/
+.idea/
+
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored.
+# Committing it pins provider versions, which supports the dependency review.
