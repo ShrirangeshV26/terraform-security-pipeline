@@ -1,0 +1,302 @@
+# Terraform CI: runs on every pull request to main and blocks the merge
+# if formatting, validation, linting, or the security policy fails.
+
+name: Terraform CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only by default. Jobs that need more (uploading scan results,
+# commenting on PRs) ask for it explicitly.
+permissions:
+  contents: read
+
+# If I push a new commit to the same PR, cancel the older run.
+concurrency:
+  group: terraform-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.17.1"
+  TFLINT_VERSION: "v0.65.0"
+  TRIVY_VERSION: "v0.76.2"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  # "enforce" blocks merges on policy violations. "warn" only reports them.
+  # Warn mode lets a team roll this out on existing code without blocking
+  # every PR, then switch to enforce once the existing findings are fixed.
+  # Set it per repo with a repository variable named SECURITY_ENFORCEMENT.
+  SECURITY_ENFORCEMENT: ${{ vars.SECURITY_ENFORCEMENT || 'enforce' }}
+
+# Every action is pinned to a full commit SHA, not a version tag.
+# Tags can be moved to point at malicious code (this happened to
+# trivy-action in March 2026). A SHA can't be changed.
+
+jobs:
+  validate:
+    name: Terraform format and validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # the job doesn't push, so don't keep the token around
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff
+
+      # -backend=false: never touches real state.
+      # -lockfile=readonly: fails if providers don't match the committed lock file.
+      - name: Initialize without a backend
+        run: terraform init -backend=false -lockfile=readonly
+
+      # Validating the root module also validates every child module it calls.
+      - name: Validate configuration
+        run: terraform validate -no-color
+
+  tflint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up TFLint
+        uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: Install TFLint plugins
+        run: tflint --init --config "$(pwd)/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids GitHub API rate limits when downloading plugins
+
+      # --recursive lints every module directory with the same config,
+      # so this works for a repo with many modules, not just one folder.
+      - name: Run TFLint
+        run: tflint --recursive --config "$(pwd)/.tflint.hcl" --format compact --minimum-failure-severity=warning
+
+  security:
+    name: Security scan (Trivy)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # needed to upload results to the Security tab
+    outputs:
+      critical: ${{ steps.summary.outputs.critical }}
+      high: ${{ steps.summary.outputs.high }}
+      medium: ${{ steps.summary.outputs.medium }}
+      low: ${{ steps.summary.outputs.low }}
+      blocking: ${{ steps.summary.outputs.blocking }}
+      exceptions: ${{ steps.exceptions.outputs.count }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Every skipped finding needs a written reason right above it:
+      #   # Exception: <why this is acceptable>
+      #   #trivy:ignore:<check-id>
+      # An exception without a reason fails the build.
+      - name: Check that every exception is documented
+        id: exceptions
+        run: |
+          count=0
+          missing=0
+          {
+            echo "## Documented security exceptions"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS=: read -r file line _; do
+            count=$((count + 1))
+            prev=$(sed -n "$((line - 1))p" "$file")
+            if echo "$prev" | grep -qi "exception:"; then
+              reason=$(echo "$prev" | sed 's/.*[Ee]xception:[[:space:]]*//')
+              echo "- \`$file:$line\`: $reason" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error file=$file,line=$line::This Trivy exception has no documented reason. Add '# Exception: <reason>' on the line above it."
+              missing=$((missing + 1))
+            fi
+          done < <(grep -rn "trivy:ignore" terraform --include="*.tf" || true)
+
+          [ "$count" -eq 0 ] && echo "None." >> "$GITHUB_STEP_SUMMARY"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          if [ "$missing" -gt 0 ]; then
+            exit 1
+          fi
+
+      # Scan once and save everything (all severities) to JSON.
+      # The pass/fail decision happens later, so we always get the full report.
+      - name: Scan Terraform for misconfigurations
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: terraform
+          format: json
+          output: trivy-results.json
+          exit-code: "0"
+          version: ${{ env.TRIVY_VERSION }}
+
+      - name: Convert results to SARIF
+        run: trivy convert --format sarif --output trivy-results.sarif trivy-results.json
+
+      - name: Upload results to GitHub Security tab
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-terraform
+
+      # Apply the failure policy to each finding:
+      #   - CRITICAL and HIGH always block.
+      #   - MEDIUM blocks when it's about encryption, public access,
+      #     IAM permissions, or logging (the areas that matter most for patient data).
+      #   - Everything else is reported as a warning.
+      - name: Apply failure policy and summarize
+        id: summary
+        run: |
+          jq '[.Results[]? | .Target as $t | .Misconfigurations[]? | select(.Status == "FAIL")
+               | {
+                   severity: .Severity,
+                   id: (.AVDID // .ID),
+                   title: .Title,
+                   location: "\($t):\(.CauseMetadata.StartLine // "?")",
+                   blocking: (
+                     .Severity == "CRITICAL" or .Severity == "HIGH" or
+                     (.Severity == "MEDIUM" and (.Title | test("encrypt|public|iam|polic|wildcard|privilege|log"; "i")))
+                   )
+                 }]
+               | sort_by({"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3}[.severity] // 4)' \
+            trivy-results.json > findings.json
+
+          count() { jq --arg s "$1" '[.[] | select(.severity == $s)] | length' findings.json; }
+          critical=$(count CRITICAL)
+          high=$(count HIGH)
+          medium=$(count MEDIUM)
+          low=$(count LOW)
+          blocking=$(jq '[.[] | select(.blocking)] | length' findings.json)
+
+          {
+            echo "critical=$critical"
+            echo "high=$high"
+            echo "medium=$medium"
+            echo "low=$low"
+            echo "blocking=$blocking"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Trivy security scan"
+            echo ""
+            echo "Enforcement mode: **$SECURITY_ENFORCEMENT**"
+            echo ""
+            echo "| Severity | Count |"
+            echo "|---|---|"
+            echo "| Critical | $critical |"
+            echo "| High | $high |"
+            echo "| Medium | $medium |"
+            echo "| Low | $low |"
+            echo "| **Blocking under policy** | **$blocking** |"
+            echo ""
+            if [ "$(jq 'length' findings.json)" -gt 0 ]; then
+              echo "| Blocks merge | Severity | Check | Issue | Location |"
+              echo "|---|---|---|---|---|"
+              jq -r '.[] | "| \(if .blocking then "Yes" else "No (warning)" end) | \(.severity) | \(.id) | \(.title) | `\(.location)` |"' findings.json | head -50
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce failure policy
+        env:
+          BLOCKING: ${{ steps.summary.outputs.blocking }}
+        run: |
+          if [ "$BLOCKING" -eq 0 ]; then
+            echo "No findings that block under the policy."
+            exit 0
+          fi
+
+          if [ "$SECURITY_ENFORCEMENT" = "warn" ]; then
+            echo "::warning::$BLOCKING findings would block this merge, but enforcement is in warn mode."
+            exit 0
+          fi
+
+          echo "::error::$BLOCKING findings violate the security policy. Fix them, or add a documented exception, before merging."
+          exit 1
+
+  # Posts one comment on the PR with the results of every check,
+  # and updates the same comment on later pushes instead of adding new ones.
+  report:
+    name: Post PR summary
+    if: always() && github.event_name == 'pull_request'
+    needs: [validate, tflint, security]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment results on the pull request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          VALIDATE: ${{ needs.validate.result }}
+          TFLINT: ${{ needs.tflint.result }}
+          SECURITY: ${{ needs.security.result }}
+          CRITICAL: ${{ needs.security.outputs.critical || 'n/a' }}
+          HIGH: ${{ needs.security.outputs.high || 'n/a' }}
+          MEDIUM: ${{ needs.security.outputs.medium || 'n/a' }}
+          LOW: ${{ needs.security.outputs.low || 'n/a' }}
+          BLOCKING: ${{ needs.security.outputs.blocking || 'n/a' }}
+          EXCEPTIONS: ${{ needs.security.outputs.exceptions || '0' }}
+        with:
+          script: |
+            const e = process.env;
+            const icon = (r) => ({ success: '✅', failure: '❌' }[r] || '⚪');
+            const marker = '<!-- terraform-ci-report -->';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = [
+              marker,
+              '## Terraform CI results',
+              '',
+              '| Check | Result |',
+              '|---|---|',
+              `| Format and validate | ${icon(e.VALIDATE)} ${e.VALIDATE} |`,
+              `| TFLint | ${icon(e.TFLINT)} ${e.TFLINT} |`,
+              `| Security scan (Trivy) | ${icon(e.SECURITY)} ${e.SECURITY} |`,
+              '',
+              `**Security findings:** ${e.CRITICAL} critical, ${e.HIGH} high, ${e.MEDIUM} medium, ${e.LOW} low`,
+              `**Blocking under policy:** ${e.BLOCKING}  |  **Documented exceptions:** ${e.EXCEPTIONS}  |  **Mode:** ${e.SECURITY_ENFORCEMENT}`,
+              '',
+              'Policy: critical and high findings always block. Medium findings block when they involve encryption, public access, IAM permissions, or logging. Other findings are warnings.',
+              '',
+              `[Full details in the workflow run](${runUrl})`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
