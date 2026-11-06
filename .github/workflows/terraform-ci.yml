@@ -24,6 +24,7 @@ env:
   TF_VERSION: "1.17.1"
   TFLINT_VERSION: "v0.65.0"
   TRIVY_VERSION: "v0.76.2"
+  CHECKOV_VERSION: "3.4.3"
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
   # "enforce" blocks merges on policy violations. "warn" only reports them.
@@ -31,6 +32,9 @@ env:
   # every PR, then switch to enforce once the existing findings are fixed.
   # Set it per repo with a repository variable named SECURITY_ENFORCEMENT.
   SECURITY_ENFORCEMENT: ${{ vars.SECURITY_ENFORCEMENT || 'enforce' }}
+  # Checkov's IAM checks. Each ID here was confirmed to fire on a deliberate
+  # wildcard test policy, written both as an aws_iam_policy_document and as inline JSON.
+  IAM_CHECKS: "CKV_AWS_1,CKV_AWS_49,CKV_AWS_62,CKV_AWS_63,CKV_AWS_107,CKV_AWS_108,CKV_AWS_109,CKV_AWS_110,CKV_AWS_111,CKV_AWS_286,CKV_AWS_287,CKV_AWS_288,CKV_AWS_289,CKV_AWS_290,CKV_AWS_355,CKV_AWS_356,CKV2_AWS_40"
 
 # Every action is pinned to a full commit SHA, not a version tag.
 # Tags can be moved to point at malicious code (this happened to
@@ -113,33 +117,57 @@ jobs:
         with:
           persist-credentials: false
 
-      # Every skipped finding needs a written reason right above it:
-      #   # Exception: <why this is acceptable>
-      #   #trivy:ignore:<check-id>
+      # Every skipped finding needs a written reason:
+      #   Trivy:   "# Exception: <reason>" on the line above "#trivy:ignore:<check>"
+      #   Checkov: "#checkov:skip=<check>:<reason>" (the reason is part of the skip)
       # An exception without a reason fails the build.
       - name: Check that every exception is documented
         id: exceptions
         run: |
           count=0
           missing=0
-          {
-            echo "## Documented security exceptions"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
+          rows=$(mktemp)
 
+          # Trivy exceptions
           while IFS=: read -r file line _; do
             count=$((count + 1))
+            check=$(sed -n "${line}p" "$file" | sed -E 's/.*trivy:ignore:([A-Za-z0-9_-]+).*/\1/')
             prev=$(sed -n "$((line - 1))p" "$file")
             if echo "$prev" | grep -qi "exception:"; then
-              reason=$(echo "$prev" | sed 's/.*[Ee]xception:[[:space:]]*//')
-              echo "- \`$file:$line\`: $reason" >> "$GITHUB_STEP_SUMMARY"
+              reason=$(echo "$prev" | sed -E 's/.*[Ee]xception:[[:space:]]*//')
+              echo "| \`$file:$line\` | Trivy | $check | $reason |" >> "$rows"
             else
               echo "::error file=$file,line=$line::This Trivy exception has no documented reason. Add '# Exception: <reason>' on the line above it."
               missing=$((missing + 1))
             fi
           done < <(grep -rn "trivy:ignore" terraform --include="*.tf" || true)
 
-          [ "$count" -eq 0 ] && echo "None." >> "$GITHUB_STEP_SUMMARY"
+          # Checkov exceptions
+          while IFS=: read -r file line content; do
+            count=$((count + 1))
+            check=$(echo "$content" | sed -E 's/.*checkov:skip=([A-Za-z0-9_]+).*/\1/')
+            reason=$(echo "$content" | sed -nE 's/.*checkov:skip=[A-Za-z0-9_]+:[[:space:]]*(.+)$/\1/p')
+            if [ -n "$reason" ]; then
+              echo "| \`$file:$line\` | Checkov | $check | $reason |" >> "$rows"
+            else
+              echo "::error file=$file,line=$line::This Checkov skip has no documented reason. Use '#checkov:skip=<check>:<reason>'."
+              missing=$((missing + 1))
+            fi
+          done < <(grep -rn "checkov:skip=" terraform --include="*.tf" || true)
+
+          {
+            echo "## Documented security exceptions"
+            echo ""
+            if [ "$count" -eq 0 ]; then
+              echo "None."
+            else
+              echo "| Location | Tool | Check | Reason |"
+              echo "|---|---|---|---|"
+              cat "$rows"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
           echo "count=$count" >> "$GITHUB_OUTPUT"
 
           if [ "$missing" -gt 0 ]; then
@@ -242,12 +270,79 @@ jobs:
           echo "::error::$BLOCKING findings violate the security policy. Fix them, or add a documented exception, before merging."
           exit 1
 
+  # Trivy didn't flag wildcard IAM role policies when I tested it with
+  # deliberate "Action: *, Resource: *" policies. Checkov does, so this job
+  # covers that gap. Only IAM checks run here, and every failure blocks.
+  iam:
+    name: IAM policy scan (Checkov)
+    runs-on: ubuntu-latest
+    outputs:
+      failed: ${{ steps.summary.outputs.failed }}
+      skipped: ${{ steps.summary.outputs.skipped }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installed with pipx at a pinned version, so the job always runs the same Checkov.
+      - name: Install Checkov
+        run: pipx install "checkov==${CHECKOV_VERSION}"
+
+      # Prints results to the log and also saves them as JSON for the summary.
+      # The pass/fail decision happens in a later step.
+      - name: Scan IAM policies
+        run: |
+          checkov -d terraform --framework terraform --check "$IAM_CHECKS" --compact --quiet \
+            --output cli --output json --output-file-path console,checkov-results.json || true
+
+      - name: Summarize IAM findings
+        id: summary
+        run: |
+          results=checkov-results.json
+          norm='if type == "array" then .[0] else . end'
+
+          failed=$(jq "$norm | .summary.failed // 0" "$results")
+          skipped=$(jq "$norm | .summary.skipped // 0" "$results")
+
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+          echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## IAM policy scan (Checkov)"
+            echo ""
+            echo "Failed: **$failed** | Documented exceptions: **$skipped**"
+            echo ""
+            if [ "$failed" -gt 0 ]; then
+              echo "| Check | Issue | Resource | Location |"
+              echo "|---|---|---|---|"
+              jq -r "$norm | .results.failed_checks[]? | \"| \(.check_id) | \(.check_name) | \(.resource) | \`\(.file_path):\(.file_line_range[0])\` |\"" "$results"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce IAM policy
+        env:
+          FAILED: ${{ steps.summary.outputs.failed }}
+        run: |
+          if [ "$FAILED" -eq 0 ]; then
+            echo "No IAM policy violations."
+            exit 0
+          fi
+
+          if [ "$SECURITY_ENFORCEMENT" = "warn" ]; then
+            echo "::warning::$FAILED IAM policy violations, but enforcement is in warn mode."
+            exit 0
+          fi
+
+          echo "::error::$FAILED IAM policy violations. Scope the policy down, or add a documented exception, before merging."
+          exit 1
+
   # Posts one comment on the PR with the results of every check,
   # and updates the same comment on later pushes instead of adding new ones.
   report:
     name: Post PR summary
     if: always() && github.event_name == 'pull_request'
-    needs: [validate, tflint, security]
+    needs: [validate, tflint, security, iam]
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -258,11 +353,13 @@ jobs:
           VALIDATE: ${{ needs.validate.result }}
           TFLINT: ${{ needs.tflint.result }}
           SECURITY: ${{ needs.security.result }}
+          IAM: ${{ needs.iam.result }}
           CRITICAL: ${{ needs.security.outputs.critical || 'n/a' }}
           HIGH: ${{ needs.security.outputs.high || 'n/a' }}
           MEDIUM: ${{ needs.security.outputs.medium || 'n/a' }}
           LOW: ${{ needs.security.outputs.low || 'n/a' }}
           BLOCKING: ${{ needs.security.outputs.blocking || 'n/a' }}
+          IAM_FAILED: ${{ needs.iam.outputs.failed || 'n/a' }}
           EXCEPTIONS: ${{ needs.security.outputs.exceptions || '0' }}
         with:
           script: |
@@ -280,11 +377,12 @@ jobs:
               `| Format and validate | ${icon(e.VALIDATE)} ${e.VALIDATE} |`,
               `| TFLint | ${icon(e.TFLINT)} ${e.TFLINT} |`,
               `| Security scan (Trivy) | ${icon(e.SECURITY)} ${e.SECURITY} |`,
+              `| IAM policy scan (Checkov) | ${icon(e.IAM)} ${e.IAM} |`,
               '',
-              `**Security findings:** ${e.CRITICAL} critical, ${e.HIGH} high, ${e.MEDIUM} medium, ${e.LOW} low`,
-              `**Blocking under policy:** ${e.BLOCKING}  |  **Documented exceptions:** ${e.EXCEPTIONS}  |  **Mode:** ${e.SECURITY_ENFORCEMENT}`,
+              `**Trivy findings:** ${e.CRITICAL} critical, ${e.HIGH} high, ${e.MEDIUM} medium, ${e.LOW} low (${e.BLOCKING} blocking)`,
+              `**IAM violations:** ${e.IAM_FAILED}  |  **Documented exceptions:** ${e.EXCEPTIONS}  |  **Mode:** ${e.SECURITY_ENFORCEMENT}`,
               '',
-              'Policy: critical and high findings always block. Medium findings block when they involve encryption, public access, IAM permissions, or logging. Other findings are warnings.',
+              'Policy: critical and high findings always block. Medium findings block when they involve encryption, public access, IAM permissions, or logging. Any IAM policy violation blocks. Other findings are warnings.',
               '',
               `[Full details in the workflow run](${runUrl})`,
             ].join('\n');
