@@ -22,6 +22,11 @@ resource "aws_kms_alias" "main" {
 }
 
 data "aws_iam_policy_document" "kms" {
+  # Exceptions (the pipeline checks that each one has a reason):
+  #checkov:skip=CKV_AWS_109:This is a KMS key policy, where "*" means this key only. The root account statement is AWS's default key policy and is needed so the key can always be managed.
+  #checkov:skip=CKV_AWS_111:Same reason. Key policy statements only apply to this key, and CloudWatch Logs access is limited by an encryption context condition.
+  #checkov:skip=CKV_AWS_356:Same reason. In a key policy, the resource must be "*", which refers to the key itself.
+
   # The account keeps full control of the key. This is AWS's default key
   # policy statement. Without it, nobody could manage the key once it exists.
   statement {

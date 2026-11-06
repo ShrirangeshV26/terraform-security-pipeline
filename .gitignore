@@ -9,6 +9,8 @@
 *.tfplan
 tfplan
 tfplan.json
+# Lambda packages built by Terraform
+build/
 
 # Variable files (may contain sensitive values); keep the example
 *.tfvars
