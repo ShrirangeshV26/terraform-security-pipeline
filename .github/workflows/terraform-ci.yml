@@ -1,5 +1,5 @@
 # Terraform CI: runs on every pull request to main and blocks the merge
-# if formatting, validation, linting, or the security policy fails.
+# if formatting, validation, safety tests, linting, or the security policy fails.
 
 name: Terraform CI
 
@@ -70,6 +70,12 @@ jobs:
       # Validating the root module also validates every child module it calls.
       - name: Validate configuration
         run: terraform validate -no-color
+
+      # Deployment safety tests: terraform plan against a mock AWS provider
+      # (no credentials needed). Fails if a change would remove deletion
+      # protection, backups, encryption, versioning, or log retention.
+      - name: Run deployment safety tests
+        run: terraform test -no-color
 
   tflint:
     name: TFLint
@@ -374,7 +380,7 @@ jobs:
               '',
               '| Check | Result |',
               '|---|---|',
-              `| Format and validate | ${icon(e.VALIDATE)} ${e.VALIDATE} |`,
+              `| Format, validate, and safety tests | ${icon(e.VALIDATE)} ${e.VALIDATE} |`,
               `| TFLint | ${icon(e.TFLINT)} ${e.TFLINT} |`,
               `| Security scan (Trivy) | ${icon(e.SECURITY)} ${e.SECURITY} |`,
               `| IAM policy scan (Checkov) | ${icon(e.IAM)} ${e.IAM} |`,
@@ -382,7 +388,7 @@ jobs:
               `**Trivy findings:** ${e.CRITICAL} critical, ${e.HIGH} high, ${e.MEDIUM} medium, ${e.LOW} low (${e.BLOCKING} blocking)`,
               `**IAM violations:** ${e.IAM_FAILED}  |  **Documented exceptions:** ${e.EXCEPTIONS}  |  **Mode:** ${e.SECURITY_ENFORCEMENT}`,
               '',
-              'Policy: critical and high findings always block. Medium findings block when they involve encryption, public access, IAM permissions, or logging. Any IAM policy violation blocks. Other findings are warnings.',
+              'Policy: critical and high findings always block. Medium findings block when they involve encryption, public access, IAM permissions, or logging. Any IAM policy violation blocks. Deployment safety tests must pass. Other findings are warnings.',
               '',
               `[Full details in the workflow run](${runUrl})`,
             ].join('\n');
