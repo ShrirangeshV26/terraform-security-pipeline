@@ -121,17 +121,3 @@ resource "aws_lambda_function" "intake" {
 
   depends_on = [aws_iam_role_policy.intake]
 }
-
-# Demo: a "quick fix" that gives the Lambda full admin access.
-resource "aws_iam_role_policy" "intake_admin" {
-  name = "intake-admin-quick-fix"
-  role = aws_iam_role.intake.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = "*"
-      Resource = "*"
-    }]
-  })
-}
