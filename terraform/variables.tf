@@ -36,7 +36,7 @@ variable "private_subnet_cidrs" {
 variable "db_instance_class" {
   description = "Instance class for the PostgreSQL database."
   type        = string
-  default     = "db.t4g.medium"
+  default     = "db.t4g.medim"
 }
 
 variable "db_name" {
