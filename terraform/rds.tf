@@ -105,7 +105,7 @@ resource "aws_db_instance" "postgres" {
 
   # Protection against accidental deletion: AWS refuses to delete the database
   # while this is on, and a final snapshot is always taken if it's ever removed.
-  deletion_protection       = false
+  deletion_protection       = true
   skip_final_snapshot       = false
   final_snapshot_identifier = "${local.db_identifier}-final"
 
